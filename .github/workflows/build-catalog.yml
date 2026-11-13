@@ -42,7 +42,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python .github/scripts/build_catalog.py
+        run: python scripts/build_catalog.py
 
       - name: Commit if changed
         run: |
