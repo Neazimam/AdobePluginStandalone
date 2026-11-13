@@ -22,7 +22,9 @@ For each release, the brain reads everything it can see:
   - version: extracted from the tag/title/asset/exe filename via regex
   - description: built from the product name + inferred category + activator presence
   - tags: inferred from keyword matches in the exe/zip/title (glow, color, motion, ...)
-  - plugin_type: "aeplugin" (default) or "core" if the filename mentions core/mediacore
+  - plugin_type: always "standalone" — these are exe installers EAGLE must
+    RUN (not plugin files to copy into the AE Plug-ins folder). The release
+    body can override this if a release genuinely needs a different type.
 
 The script handles the deterministic fields too:
   - sha256 (hash of the downloaded zip)
@@ -40,7 +42,7 @@ TAG FORMATS — any tag works (the brain reads the zip to figure out the product
 
 If you set a field explicitly in the release body (one `key: value` per line),
 that value OVERRIDES the brain's choice:
-  plugin_type: core
+  plugin_type: standalone
   description: A fast GPU glow plugin for After Effects.
   tags: motion, glow, light, gpu
 
@@ -247,12 +249,30 @@ def extract_version(*candidates):
 
 
 def strip_installer_suffix(filename):
-    """Remove the .exe extension and common installer/version suffixes to
-    reveal the product name. e.g. 'DeepGlow_Setup_v3.exe' -> 'DeepGlow'."""
-    # Drop the extension first.
+    """Remove the .exe extension and any installer/version suffixes to reveal
+    the product name.
+
+    Examples:
+      'DeepGlow_Setup_v3.exe'  -> 'DeepGlow'
+      'Saber1.0.40.exe'       -> 'Saber'        (version glued, no separator)
+      'ColorMamba_3.1.exe'    -> 'ColorMamba'
+      'ParticleFX-v2.0.exe'   -> 'ParticleFX'
+    """
+    # Drop the .exe extension first.
     name = re.sub(r"\.exe$", "", filename, flags=re.IGNORECASE)
-    # Try each known suffix pattern (case-insensitive). Stop at the first
-    # that matches — this gives the cleanest product name.
+
+    # 1) Cut at the first version pattern. This handles BOTH separated
+    #    ('DeepGlow_1.2.3') and glued ('Saber1.0.40') versions — and it's the
+    #    most reliable signal because product names rarely contain a dotted
+    #    digit run. VERSION_RE requires a dotted version (1.2, 1.2.3, ...).
+    vm = VERSION_RE.search(name)
+    if vm and vm.start() > 0:
+        candidate = name[:vm.start()].rstrip("-_ .")
+        if candidate and any(c.isalpha() for c in candidate):
+            return candidate
+
+    # 2) Try each known installer suffix pattern (case-insensitive). Stop at
+    #    the first that matches.
     lowered = name.lower()
     for suf in INSTALLER_SUFFIXES:
         idx = lowered.find(suf.lower())
@@ -260,13 +280,15 @@ def strip_installer_suffix(filename):
             candidate = name[:idx]
             if candidate and any(c.isalnum() for c in candidate):
                 return candidate
-    # Fallback: cut at the first digit run preceded by a separator (a version
-    # like 'DeepGlow_1.2' or 'DeepGlow 3').
+
+    # 3) Fallback: cut at the first digit run preceded by a separator. Catches
+    #    a bare integer version like 'DeepGlow_3' or 'DeepGlow 3' (no dot).
     m = re.search(r"[-_\s]\d", name)
     if m:
         candidate = name[:m.start()]
         if candidate and any(c.isalnum() for c in candidate):
             return candidate
+
     return name
 
 
@@ -333,24 +355,18 @@ def infer_tags(*candidates):
     return tags[:5]
 
 
-def infer_plugin_type(*candidates):
-    """'core' if any candidate mentions mediacore or core plugin, else 'aeplugin'."""
-    haystack = " ".join(c or "" for c in candidates).lower()
-    if "mediacore" in haystack or "core-plug" in haystack or "core plug" in haystack:
-        return "core"
-    # 'core' alone is too generic (matches 'score', 'hardcore', etc.), so
-    # only trigger on the explicit patterns above. Otherwise default.
-    return "aeplugin"
-
-
-def build_description(name, tags, activator):
+def build_description(name, tags, activator, slug=""):
     """Assemble a one-sentence description from the inferred pieces.
 
-    Only 'real' category tags (glow, color, motion, ...) shape the description;
-    the 'activator' tag is metadata, not a category, so it's filtered out here.
+    Only 'real' category tags (glow, color, motion, ...) shape the description.
+    Metadata tags (activator, plugin, after-effects) and the product's OWN slug
+    (added as a tag so the entry is searchable by name) are filtered out, since
+    the slug isn't a category — describing "Saber" as "a saber plugin" is noise.
     """
-    category_tags = [t for t in tags if t not in ("activator", "plugin",
-                                                   "after-effects")]
+    excluded = {"activator", "plugin", "after-effects"}
+    if slug:
+        excluded.add(slug.lower())
+    category_tags = [t for t in tags if t.lower() not in excluded]
     if category_tags:
         primary = category_tags[0]
         article = "an" if primary[0] in "aeiou" else "a"
@@ -396,15 +412,27 @@ def analyze_with_brain(tag, title, body, asset_name, zip_contents):
     if activator and "activator" not in tags:
         tags.append("activator")
     if not keyword_tags:
-        # No real category keywords matched — use the generic defaults.
-        tags = ["plugin", "after-effects"] + (["activator"] if activator else [])
+        # No real category keywords matched. Use the generic defaults PLUS the
+        # product slug as a tag, so the entry is searchable by its own name
+        # (e.g. a 'Saber' plugin with no keyword match can still be found by
+        # searching 'saber').
+        name_tag = slug if slug and slug not in ("plugin",) else ""
+        tags = ["plugin", "after-effects"]
+        if name_tag:
+            tags.append(name_tag)
+        if activator:
+            tags.append("activator")
 
     # --- plugin_type ---
-    plugin_type = infer_plugin_type(installer_exe or "", asset_name or "",
-                                     title or "", body or "")
+    # --- plugin_type ---
+    # This repo hosts ONLY standalone exe installers — EAGLE must RUN the
+    # exe (and activator if present), not copy files into the AE Plug-ins
+    # folder. So the default is always "standalone". The release body can
+    # still override it if a release genuinely needs a different type.
+    plugin_type = "standalone"
 
     # --- description ---
-    description = build_description(name, tags, activator)
+    description = build_description(name, tags, activator, slug)
 
     return {
         "id": slug,
