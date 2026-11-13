@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "id": "saber-1-0-40",
+    "category": "plugin",
+    "name": "Saber1.0.40",
+    "version": "1.0.40",
+    "last_updated": "2026-11-13",
+    "link": "https://github.com/Neazimam/AdobePluginStandalone/releases/download/standalone/Saber_1.0.40.zip",
+    "plugin_type": "aeplugin",
+    "description": "Saber1.0.40 — a plugin for After Effects.",
+    "sha256": "ded8e0ee879c217e16ee06320b9f00eeac40e8fabfc3ce35d8ca2aa48df6521f",
+    "size_bytes": 773315,
+    "tags": [
+      "plugin"
+    ]
+  }
+]
