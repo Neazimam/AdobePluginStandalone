@@ -1,0 +1,57 @@
+# Build After-Effect-HUB.json from this repo's own releases.
+#
+# Triggered whenever a release is published / edited / deleted, on a daily
+# rebuild (catches drift), and manually from the Actions tab. Lists every
+# non-draft release in THIS repo, downloads each release's first .zip asset,
+# computes its sha256 + size, and writes a flat JSON array to
+# After-Effect-HUB.json — then commits the file if it changed.
+#
+# No PAT needed: the auto-provided GITHUB_TOKEN (with contents:write) is enough
+# because the workflow catalogues its own repo into its own file.
+name: Build Catalog
+
+on:
+  release:
+    types: [published, unpublished, edited, deleted]
+  workflow_dispatch:
+  schedule:
+    # 06:00 UTC daily — rebuilds the catalog so deletions / edits are reflected
+    # even if the release event was missed.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-catalog
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build catalog JSON
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python .github/scripts/build_catalog.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add After-Effect-HUB.json
+          if git diff --cached --quiet; then
+            echo "No changes — catalog is up to date."
+          else
+            git commit -m "chore: rebuild After-Effect-HUB.json from releases"
+            git push
+          fi
