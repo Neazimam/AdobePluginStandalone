@@ -1,17 +1,28 @@
 [
   {
-    "id": "saber",
+    "id": "saber-1-0-40",
     "category": "plugin",
-    "name": "Saber",
-    "version": "1.0.40",
+    "name": "Adobe-Pluginsexe",
+    "version": "1.0",
     "last_updated": "2026-11-13",
     "link": "https://github.com/Neazimam/AdobePluginStandalone/releases/download/standalone/Saber_1.0.40.zip",
-    "plugin_type": "standalone",
-    "description": "Saber — a plugin for After Effects.",
+    "plugin_type": "aeplugin",
+    "description": null,
     "sha256": "ded8e0ee879c217e16ee06320b9f00eeac40e8fabfc3ce35d8ca2aa48df6521f",
     "size_bytes": 773315,
-    "tags": [
-      "plugin"
-    ]
+    "tags": []
+  },
+  {
+    "id": "topaz-video-ai-pro-7-1-6",
+    "category": "plugin",
+    "name": "Adobe-Pluginsexe",
+    "version": "1.0",
+    "last_updated": "2026-11-13",
+    "link": "https://github.com/Neazimam/AdobePluginStandalone/releases/download/standalone/Topaz.Video.AI.Pro-7.1.6.zip",
+    "plugin_type": "aeplugin",
+    "description": null,
+    "sha256": "c1ae9c7738d024ed4377a9aa2c0756b95fd124a7d2f05fa40b04371be24c226e",
+    "size_bytes": 242477137,
+    "tags": []
   }
 ]
