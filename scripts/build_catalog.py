@@ -1,57 +1,58 @@
 #!/usr/bin/env python3
 """
-Build After-Effect-HUB.json from THIS repo's own GitHub releases, using a
-BUILT-IN BRAIN (pure Python, no AI API, no keys, no secrets).
+Build After-Effect-HUB.json from THIS repo's own GitHub releases, using an
+AI BRAIN that analyzes each release and decides all the catalog metadata.
 
 This repo hosts ONLY standalone exe-installer plugins — a .zip containing
 installer.exe (any name) [+ activator.exe]. The workflow catalogs each
 release into a flat JSON array that the EAGLE app fetches as a secondary
 catalog. Every entry has category="plugin" hardcoded.
 
-THE BRAIN (no AI, no API, no keys)
----------------------------------
-For each release, the brain reads everything it can see:
+THE AI BRAIN (GitHub Models, free, uses GITHUB_TOKEN)
+----------------------------------------------------
+For each release, the script sends the AI a complete picture:
   - the release tag, title, body
   - the .zip asset filename
-  - the LIST OF FILES INSIDE THE ZIP (names + sizes)
+  - the LIST OF FILES INSIDE THE ZIP (names + sizes) — so the AI can
+    identify the product from the installer's filename, e.g.
+    "DeepGlow_Setup.exe" -> product is "DeepGlow"
 
-...and figures out the catalog metadata using pure-Python heuristics:
-  - id (stable slug): derived from the installer .exe's name, stripped of
-    common installer/version suffixes (e.g. "DeepGlow_Setup_v3.exe" -> "deepglow")
-  - name (display name): the product name, title-cased
-  - version: extracted from the tag/title/asset/exe filename via regex
-  - description: built from the product name + inferred category + activator presence
-  - tags: inferred from keyword matches in the exe/zip/title (glow, color, motion, ...)
-  - plugin_type: always "standalone" — these are exe installers EAGLE must
-    RUN (not plugin files to copy into the AE Plug-ins folder). The release
-    body can override this if a release genuinely needs a different type.
+The AI then decides ALL the human-meaningful metadata:
+  - id (stable slug)
+  - name (display name)
+  - version
+  - description (one sentence)
+  - tags (3-5 relevant)
+  - plugin_type (aeplugin or core)
 
-The script handles the deterministic fields too:
+The script handles ONLY the deterministic fields the AI can't know:
   - sha256 (hash of the downloaded zip)
   - size_bytes (zip file size)
   - link (the release asset's download URL)
   - last_updated (the release's publish date)
   - category (always "plugin" — this repo hosts plugins only)
 
-TAG FORMATS — any tag works (the brain reads the zip to figure out the product)
------------------------------------------------------------------------------
+If the AI call fails (network, auth, rate-limit, bad JSON), the script
+falls back to heuristics (tag as slug, "1.0" version, empty description).
+The workflow ALWAYS succeeds — AI is the brain, but heuristics are the
+safety net.
+
+TAG FORMATS
+-----------
+Any tag is accepted. The AI reads the tag + everything else and decides
+the slug + version itself. Examples that all work:
   - standalone
   - ae-deepglow/1.1.1
   - DeepGlow_1.2
   - adobe-plugin-v2
 
-If you set a field explicitly in the release body (one `key: value` per line),
-that value OVERRIDES the brain's choice:
-  plugin_type: standalone
-  description: A fast GPU glow plugin for After Effects.
-  tags: motion, glow, light, gpu
-
 Run by .github/workflows/build-catalog.yml. Requires the gh CLI (authenticated
-via GH_TOKEN — already there for git) and the GITHUB_REPOSITORY env var.
+via GH_TOKEN) and the GITHUB_REPOSITORY env var (auto-set by Actions).
 
 OUTPUT
 ------
-After-Effect-HUB.json — a flat JSON array, one object per release, sorted by
+After-Effect-HUB.json — a flat JSON array, one object per .zip ASSET (a
+release may host multiple plugins — each zip is its own entry), sorted by
 name (case-insensitive) for a stable, reviewable diff.
 """
 import hashlib
@@ -60,108 +61,19 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 CATALOG_FILE = "After-Effect-HUB.json"
 
-# Tag in the exact <slug>/<version> convention — used directly, no brain needed.
-TAG_RE = re.compile(r"^([a-z0-9][a-z0-9-]*)/(.+)$")
-
-# Version patterns, tried in order. Matches 1.2, 1.2.3, 1.2.3.4, v1.2, V1.2.3,
-# optionally with -beta / -rc1 / -alpha suffixes.
-VERSION_RE = re.compile(
-    r"v?(?P<ver>\d+\.\d+(?:\.\d+){0,2}(?:[-_.]?(?:beta|alpha|rc|pre)\d?)?)",
-    re.IGNORECASE,
-)
-
-# Suffixes/substrings stripped from an installer .exe filename to reveal the
-# product name. Order matters — longer/more-specific first. Matched case-
-# insensitively, with any of [-_ ] as the leading separator allowed.
-INSTALLER_SUFFIXES = [
-    "_setup_v", "-setup-v", " setup v", "_setup_", "-setup-", " setup ",
-    "_setup",   "-setup",   " setup",
-    "_installer_v", "-installer-v", " installer v",
-    "_installer_", "-installer-", " installer ",
-    "_installer", "-installer", " installer",
-    "_win_v",    "-win-v",    " win v",
-    "_win64_v",  "-win64-v",  " win64 v",
-    "_x64_v",    "-x64-v",    " x64 v",
-    "_final_v",  "-final-v",  " final v",
-    "_full_v",   "-full-v",   " full v",
-    "_win64",    "-win64",    " win64",
-    "_win32",    "-win32",    " win32",
-    "_x64",      "-x64",      " x64",
-    "_x86",      "-x86",      " x86",
-    "_final",    "-final",    " final",
-    "_full",     "-full",     " full",
-    "_ae",       "-ae",       " ae",
-    "_setup",    "-setup",    "setup",
-    "_installer", "-installer", "installer",
-    "_plugin",   "-plugin",   " plugin",
-    "_v",        "-v",        " v",        # version prefix — must come late
-    "_version",  "-version",  " version",
-    # NOTE: a trailing "_v3" / "-v3" (digit after v) is handled by the
-    # digit-cut fallback below, not by an entry here.
-]
-
-# Keyword -> tags to add when the keyword appears in any of the brain's inputs.
-# Keys are matched case-insensitively as substrings.
-KEYWORD_TAGS = {
-    "glow":        ["glow", "light"],
-    "light":       ["light"],
-    "color":       ["color", "grade"],
-    "colour":      ["color", "grade"],
-    "grade":       ["grade", "color"],
-    "grading":     ["grade", "color"],
-    "mamba":       ["color", "grade"],
-    "motion":      ["motion"],
-    "move":        ["motion"],
-    "particle":    ["particles"],
-    "particles":   ["particles"],
-    "blur":        ["blur"],
-    "motionblur":  ["blur", "motion"],
-    "motion-blur": ["blur", "motion"],
-    "transition":  ["transition"],
-    "transitions": ["transition"],
-    "3d":          ["3d"],
-    "3-d":         ["3d"],
-    "depth":       ["depth", "3d"],
-    "audio":       ["audio"],
-    "sound":       ["audio"],
-    "text":        ["text"],
-    "titler":      ["text"],
-    "title":       ["text"],
-    "shape":       ["shape"],
-    "shaper":      ["shape"],
-    "flare":       ["lens", "light"],
-    "lens":        ["lens"],
-    "optics":      ["lens", "light"],
-    "noise":       ["noise"],
-    "denoise":     ["noise", "denoise"],
-    "grain":       ["grain", "film"],
-    "film":        ["film", "grain"],
-    "shadow":      ["shadow"],
-    "lighting":    ["light", "lighting"],
-    "render":      ["render"],
-    "renderer":    ["render"],
-    "gpu":         ["gpu"],
-    "cuda":        ["gpu"],
-    "opencl":      ["gpu"],
-    "metal":       ["gpu"],
-    "script":      ["script"],
-    "panel":       ["ui", "panel"],
-    "ui":          ["ui"],
-    "extension":   ["ui", "extension"],
-    "fx":          ["fx"],
-    "effect":      ["fx"],
-    "effects":     ["fx"],
-    "aer":         ["render"],
-    "aescript":    ["script"],
-    "plug-in":     ["plugin"],
-    "plugin":      ["plugin"],
-}
+# GitHub Models endpoint + model. Free tier, uses the GITHUB_TOKEN for auth.
+# Override the model with the AI_MODEL env var if you want a different one.
+AI_ENDPOINT = "https://models.inference.ai.azure.com/chat/completions"
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
+AI_TIMEOUT = 45  # seconds per call — the brain does more work, so allow more time
 
 
 # ---------- GitHub CLI helper ----------
@@ -204,14 +116,10 @@ def parse_body(body):
     return meta
 
 
-def first_zip_asset(assets):
-    for a in assets or []:
-        if (a.get("name") or "").lower().endswith(".zip"):
-            return a
-    return None
+def slug_to_name(slug):
+    """ae-deepglow -> 'Ae Deepglow' (hyphens to spaces, title-cased)."""
+    return " ".join(w.capitalize() for w in slug.split("-"))
 
-
-# ---------- THE BRAIN (pure Python heuristics) ----------
 
 def sanitize_slug(text):
     """Force a string into a URL-safe slug: lowercase + hyphens."""
@@ -221,227 +129,136 @@ def sanitize_slug(text):
     return s
 
 
-def title_case_name(text):
-    """Turn 'deepglow' / 'deep_glow' / 'deep-glow' -> 'DeepGlow' (joined).
+def all_zip_assets(assets):
+    """Return every .zip asset in the release (not just the first).
 
-    For two-word product names we keep them joined as one capitalized token,
-    matching how AE plugins are typically branded ('DeepGlow', 'ColorMamba').
+    A single release may host MULTIPLE plugins — e.g. the `standalone`
+    release has Saber_1.0.40.zip + Topaz.Video.AI.Pro-7.1.6.zip. Each zip
+    is its own product and must become its own catalog entry, so we return
+    ALL of them and the main loop processes each independently.
     """
-    parts = re.split(r"[-_\s]+", (text or "").strip())
-    parts = [p for p in parts if p]
-    if not parts:
-        return ""
-    return "".join(p[:1].upper() + p[1:] for p in parts)
+    return [a for a in (assets or [])
+            if (a.get("name") or "").lower().endswith(".zip")]
 
 
-def extract_version(*candidates):
-    """Try to find a version string in any of the candidate strings.
-    Returns the first match (e.g. '1.2.3') or None."""
-    for text in candidates:
-        if not text:
-            continue
-        m = VERSION_RE.search(text)
-        if m:
-            ver = m.group("ver").strip()
-            # Normalize separators in the suffix (1.2.3-beta vs 1.2.3.beta).
-            return ver
-    return None
+# ---------- AI brain (GitHub Models) ----------
 
-
-def strip_installer_suffix(filename):
-    """Remove the .exe extension and any installer/version suffixes to reveal
-    the product name.
-
-    Examples:
-      'DeepGlow_Setup_v3.exe'  -> 'DeepGlow'
-      'Saber1.0.40.exe'       -> 'Saber'        (version glued, no separator)
-      'ColorMamba_3.1.exe'    -> 'ColorMamba'
-      'ParticleFX-v2.0.exe'   -> 'ParticleFX'
-    """
-    # Drop the .exe extension first.
-    name = re.sub(r"\.exe$", "", filename, flags=re.IGNORECASE)
-
-    # 1) Cut at the first version pattern. This handles BOTH separated
-    #    ('DeepGlow_1.2.3') and glued ('Saber1.0.40') versions — and it's the
-    #    most reliable signal because product names rarely contain a dotted
-    #    digit run. VERSION_RE requires a dotted version (1.2, 1.2.3, ...).
-    vm = VERSION_RE.search(name)
-    if vm and vm.start() > 0:
-        candidate = name[:vm.start()].rstrip("-_ .")
-        if candidate and any(c.isalpha() for c in candidate):
-            return candidate
-
-    # 2) Try each known installer suffix pattern (case-insensitive). Stop at
-    #    the first that matches.
-    lowered = name.lower()
-    for suf in INSTALLER_SUFFIXES:
-        idx = lowered.find(suf.lower())
-        if idx > 0:
-            candidate = name[:idx]
-            if candidate and any(c.isalnum() for c in candidate):
-                return candidate
-
-    # 3) Fallback: cut at the first digit run preceded by a separator. Catches
-    #    a bare integer version like 'DeepGlow_3' or 'DeepGlow 3' (no dot).
-    m = re.search(r"[-_\s]\d", name)
-    if m:
-        candidate = name[:m.start()]
-        if candidate and any(c.isalnum() for c in candidate):
-            return candidate
-
-    return name
-
-
-def find_installer_exe(zip_contents):
-    """Pick the most likely installer .exe from the zip's file list.
-    Returns the bare filename (no path) or None.
-
-    Heuristic: the installer is usually the largest .exe that is NOT named
-    'activator.exe' / 'crack.exe' / 'patch.exe' / 'keygen.exe'.
-    """
-    exe_candidates = []
-    for entry in zip_contents:
-        # zip_contents entries look like "filename (size bytes)" — split that.
-        # Take everything before the last " (".
-        bare = entry.rsplit(" (", 1)[0].strip()
-        # Strip directory components.
-        bare = bare.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        if not bare.lower().endswith(".exe"):
-            continue
-        stem = bare[:-4].lower()
-        if stem in ("activator", "crack", "patch", "keygen", "loader",
-                    "register", "license", "serial"):
-            continue
-        # Pull the size out if present.
-        size = 0
-        size_m = re.search(r"\((\d+)\s*bytes?\)", entry)
-        if size_m:
-            size = int(size_m.group(1))
-        exe_candidates.append((bare, size))
-    if not exe_candidates:
+def call_ai(prompt, token):
+    """Call GitHub Models. Returns the assistant's text, or None on failure."""
+    if not token:
         return None
-    # Largest .exe wins — the installer is almost always the biggest.
-    exe_candidates.sort(key=lambda c: c[1], reverse=True)
-    return exe_candidates[0][0]
-
-
-def has_activator(zip_contents):
-    """True if the zip contains an activator-like .exe."""
-    for entry in zip_contents:
-        bare = entry.rsplit(" (", 1)[0].strip().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        stem = bare.lower()
-        if stem.endswith(".exe"):
-            stem = stem[:-4]
-        if stem in ("activator", "crack", "patch", "keygen", "loader",
-                    "register", "license"):
-            return True
-    return False
-
-
-def infer_tags(*candidates):
-    """Scan the candidate strings for known keywords and collect tags.
-    Returns a de-duplicated, ordered list of lowercase tags (max 5)."""
-    haystack = " ".join(c or "" for c in candidates).lower()
-    tags = []
-    seen = set()
-    for keyword, tag_list in KEYWORD_TAGS.items():
-        if keyword in haystack:
-            for t in tag_list:
-                if t not in seen:
-                    seen.add(t)
-                    tags.append(t)
-        if len(tags) >= 5:
-            break
-    return tags[:5]
-
-
-def build_description(name, tags, activator, slug=""):
-    """Assemble a one-sentence description from the inferred pieces.
-
-    Only 'real' category tags (glow, color, motion, ...) shape the description.
-    Metadata tags (activator, plugin, after-effects) and the product's OWN slug
-    (added as a tag so the entry is searchable by name) are filtered out, since
-    the slug isn't a category — describing "Saber" as "a saber plugin" is noise.
-    """
-    excluded = {"activator", "plugin", "after-effects"}
-    if slug:
-        excluded.add(slug.lower())
-    category_tags = [t for t in tags if t.lower() not in excluded]
-    if category_tags:
-        primary = category_tags[0]
-        article = "an" if primary[0] in "aeiou" else "a"
-        desc = f"{name} — {article} {primary} plugin for After Effects."
-    else:
-        desc = f"{name} — a plugin for After Effects."
-    if activator:
-        desc += " Includes activator for licensing."
-    return desc
-
-
-def analyze_with_brain(tag, title, body, asset_name, zip_contents):
-    """The built-in brain. Reads everything and returns the catalog metadata.
-
-    Pure Python — no API, no network, no keys. Always returns a complete
-    dict; never raises.
-    """
-    installer_exe = find_installer_exe(zip_contents)
-    activator = has_activator(zip_contents)
-
-    # --- name + slug (prefer the installer exe's product name) ---
-    if installer_exe:
-        product = strip_installer_suffix(installer_exe)
-    else:
-        product = ""
-    if not product:
-        product = title or ""
-    if not product:
-        product = asset_name or ""
-        product = re.sub(r"\.zip$", "", product, flags=re.IGNORECASE)
-
-    name = title_case_name(product) or (title or "Plugin")
-    slug = sanitize_slug(product) or sanitize_slug(tag) or "plugin"
-
-    # --- version (scan tag, title, asset, installer exe, in that order) ---
-    version = extract_version(tag, title, asset_name, installer_exe) or "1.0"
-
-    # --- tags (scan everything for keywords) ---
-    tags = infer_tags(installer_exe or "", asset_name or "", title or "", tag or "")
-    # The activator tag is metadata, not a real category. Track keyword tags
-    # separately so the default-tag fallback fires when nothing real was found.
-    keyword_tags = list(tags)
-    if activator and "activator" not in tags:
-        tags.append("activator")
-    if not keyword_tags:
-        # No real category keywords matched. Use the generic defaults PLUS the
-        # product slug as a tag, so the entry is searchable by its own name
-        # (e.g. a 'Saber' plugin with no keyword match can still be found by
-        # searching 'saber').
-        name_tag = slug if slug and slug not in ("plugin",) else ""
-        tags = ["plugin", "after-effects"]
-        if name_tag:
-            tags.append(name_tag)
-        if activator:
-            tags.append("activator")
-
-    # --- plugin_type ---
-    # --- plugin_type ---
-    # This repo hosts ONLY standalone exe installers — EAGLE must RUN the
-    # exe (and activator if present), not copy files into the AE Plug-ins
-    # folder. So the default is always "standalone". The release body can
-    # still override it if a release genuinely needs a different type.
-    plugin_type = "standalone"
-
-    # --- description ---
-    description = build_description(name, tags, activator, slug)
-
-    return {
-        "id": slug,
-        "name": name,
-        "version": version,
-        "description": description,
-        "tags": tags,
-        "plugin_type": plugin_type,
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
     }
+    payload = {
+        "model": AI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.4,
+        "max_tokens": 600,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(AI_ENDPOINT, data=data, headers=headers,
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8")
+            result = json.loads(body)
+            return result["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        print(f"  AI HTTP {e.code}: {e.reason}", file=sys.stderr)
+        return None
+    except (urllib.error.URLError, KeyError, json.JSONDecodeError) as e:
+        print(f"  AI call failed: {e}", file=sys.stderr)
+        return None
+
+
+def list_zip_contents(path, max_files=40):
+    """Return a list of 'filename (size bytes)' strings for files in the zip.
+    Capped at max_files so huge zips don't blow up the AI prompt."""
+    contents = []
+    try:
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                contents.append(f"{info.filename} ({info.file_size} bytes)")
+                if len(contents) >= max_files:
+                    contents.append(f"... ({len(zf.namelist()) - max_files} more files)")
+                    break
+    except (zipfile.BadZipFile, OSError) as e:
+        print(f"  could not read zip contents: {e}", file=sys.stderr)
+    return contents
+
+
+def analyze_with_ai(tag, title, body, asset_name, zip_contents, token):
+    """The AI brain. Sees everything about the release + the zip's file list,
+    and decides all the catalog metadata. Returns a dict or None on failure."""
+    zip_listing = "\n".join(f"  - {f}" for f in zip_contents) or "  (empty or unreadable)"
+    body_excerpt = (body or "")[:800].replace("\n", " ")
+    prompt = (
+        "You are the brain behind an After Effects plugin catalog. "
+        "You are given a GitHub release for an AE plugin installer. "
+        "Analyze ALL the information below and decide the catalog entry's "
+        "metadata.\n\n"
+        f"RELEASE TAG: {tag}\n"
+        f"RELEASE TITLE: {title or '(none)'}\n"
+        f"RELEASE BODY: {body_excerpt or '(none)'}\n"
+        f"ZIP ASSET FILENAME: {asset_name or '(none)'}\n"
+        f"FILES INSIDE THE ZIP:\n{zip_listing}\n\n"
+        "The .exe inside the zip is the installer — its name usually reveals "
+        "the product. 'activator.exe' means the plugin needs activation. "
+        "Use everything above to identify what this plugin is.\n\n"
+        "Decide and return ONLY a JSON object (no markdown fences, no "
+        "explanation) with EXACTLY these fields:\n"
+        "{\n"
+        '  "id": "stable-url-safe-slug",\n'
+        '  "name": "Human-readable Display Name",\n'
+        '  "version": "version-string",\n'
+        '  "description": "one sentence, max 120 chars, describing what it does",\n'
+        '  "tags": ["t1", "t2", "t3"],\n'
+        '  "plugin_type": "aeplugin"\n'
+        "}\n\n"
+        "RULES:\n"
+        "- id: 3-30 chars, lowercase letters/digits/hyphens ONLY. STABLE across "
+        "version bumps (so updates are recognized). Derive from the product "
+        "name, NOT the version. e.g. 'DeepGlow_Setup.exe' -> 'deepglow'.\n"
+        "- name: the product's display name with proper capitalization "
+        "(e.g. 'DeepGlow', 'Color Mamba'). DO NOT include the version.\n"
+        "- version: extract from the tag, title, asset filename, or the exe "
+        "filename. If the tag is 'slug/version' use that version. "
+        "Default '1.0' if unclear.\n"
+        "- description: ONE sentence, max 120 chars. Be specific about what "
+        "the plugin does (glow, color grading, particles, motion blur, etc.). "
+        "Do not say 'a plugin' — describe its function.\n"
+        "- tags: 3-5 lowercase, relevant tags. Choose from common AE plugin "
+        "categories: motion, glow, color, grade, gpu, particles, transition, "
+        "audio, 3d, blur, light, text, shape, animation, render, script, ui.\n"
+        "- plugin_type: 'aeplugin' (default, installs to AE Plug-ins folder) "
+        "or 'core' (installs to the shared MediaCore folder). Use 'core' only "
+        "if the product is clearly a core/shared plugin.\n"
+        "- If the body explicitly sets any of these fields, RESPECT that value "
+        "and do not override it."
+    )
+    response = call_ai(prompt, token)
+    if not response:
+        return None
+    # Strip markdown code fences if the model wrapped the JSON.
+    response = response.strip()
+    if response.startswith("```"):
+        response = re.sub(r"^```(?:json)?\s*", "", response)
+        response = re.sub(r"\s*```$", "", response)
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", response, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                pass
+        print(f"  AI returned non-JSON: {response[:160]}", file=sys.stderr)
+        return None
 
 
 # ---------- file helpers ----------
@@ -476,25 +293,6 @@ def zip_has_exe(path):
     return False
 
 
-def list_zip_contents(path, max_files=40):
-    """Return a list of 'filename (size bytes)' strings for files in the zip.
-    Capped at max_files so huge zips don't blow up the brain's view."""
-    contents = []
-    try:
-        with zipfile.ZipFile(path) as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                contents.append(f"{info.filename} ({info.file_size} bytes)")
-                if len(contents) >= max_files:
-                    total = len(zf.namelist())
-                    contents.append(f"... ({total - max_files} more files)")
-                    break
-    except (zipfile.BadZipFile, OSError) as e:
-        print(f"  could not read zip contents: {e}", file=sys.stderr)
-    return contents
-
-
 # ---------- main ----------
 
 def main():
@@ -502,7 +300,14 @@ def main():
     if not repo:
         sys.exit("GITHUB_REPOSITORY env var is not set.")
 
-    print("Brain: built-in (no API, no keys).")
+    # AI token: prefer AI_TOKEN secret (a PAT) if set, else the Actions
+    # GITHUB_TOKEN. If neither, the brain is skipped and heuristics are used.
+    ai_token = os.environ.get("AI_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    ai_enabled = bool(ai_token)
+    if ai_enabled:
+        print(f"AI brain enabled (model: {AI_MODEL}).")
+    else:
+        print("AI brain disabled (no token). Using heuristic fallback.")
 
     releases = list_releases(repo)
     releases.sort(key=lambda r: r.get("published_at") or "")
@@ -516,76 +321,119 @@ def main():
         title = (rel.get("name") or "").strip()
         body = rel.get("body", "")
 
-        asset = first_zip_asset(rel.get("assets"))
-        if not asset:
+        # A release may host MULTIPLE plugins (multiple .zip assets). Each
+        # zip is its own product and becomes its own catalog entry —
+        # processed independently so two zips on one release don't bleed.
+        zips = all_zip_assets(rel.get("assets"))
+        if not zips:
             print(f"  skip: no .zip asset on release '{tag}'", file=sys.stderr)
             continue
 
-        asset_name = asset.get("name", "")
-
-        # --- download + validate the zip ---
-        local_path = download_asset(tag, asset_name, tmp_dir)
-        sha, size = file_sha256_and_size(local_path)
-
-        if not zip_has_exe(local_path):
-            print(f"  skip: zip '{asset_name}' on '{tag}' contains no .exe — "
-                  f"this repo hosts exe/activator zips only", file=sys.stderr)
-            os.remove(local_path)
-            continue
-
-        # --- read the zip's file listing (the brain's eyes) ---
-        zip_contents = list_zip_contents(local_path)
-        os.remove(local_path)
-
-        # --- the brain: analyze everything ---
-        result = analyze_with_brain(tag, title, body, asset_name, zip_contents)
-        slug = result["id"]
-        name = result["name"]
-        version = result["version"]
-        description = result["description"]
-        tags = result["tags"]
-        plugin_type = result["plugin_type"]
-
-        # --- explicit body fields OVERRIDE the brain ---
+        # Parse body ONCE per release — body-level overrides (plugin_type,
+        # description, tags) apply to every zip on this release.
         body_meta = parse_body(body)
-        if body_meta.get("plugin_type"):
-            plugin_type = body_meta["plugin_type"]
-        if body_meta.get("description"):
-            description = body_meta["description"]
-        if body_meta.get("tags"):
-            tags = [t.strip() for t in body_meta["tags"].split(",") if t.strip()]
+        body_plugin_type = body_meta.get("plugin_type")
+        body_description = body_meta.get("description")
+        body_tags = ([t.strip() for t in body_meta["tags"].split(",") if t.strip()]
+                     if body_meta.get("tags") else [])
 
-        # If the tag is the exact <slug>/<version> convention, prefer that.
-        m = TAG_RE.match(tag or "")
-        if m:
-            slug = m.group(1)
-            version = m.group(2)
+        for asset in zips:
+            asset_name = asset.get("name", "")
 
-        pub = rel.get("published_at") or ""
-        last_updated = pub[:10] if pub else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            # --- download + validate the zip ---
+            local_path = download_asset(tag, asset_name, tmp_dir)
+            sha, size = file_sha256_and_size(local_path)
 
-        # --- dedup by slug (newer release wins) ---
-        if slug in seen_ids:
-            print(f"  note: replacing older release for slug '{slug}'",
-                  file=sys.stderr)
-            entries = [e for e in entries if e["id"] != slug]
-        seen_ids.add(slug)
+            if not zip_has_exe(local_path):
+                print(f"  skip: zip '{asset_name}' on '{tag}' contains no .exe — "
+                      f"this repo hosts exe/activator zips only", file=sys.stderr)
+                os.remove(local_path)
+                continue
 
-        entry = {
-            "id": slug,
-            "category": "plugin",
-            "name": name,
-            "version": version,
-            "last_updated": last_updated,
-            "link": asset.get("browser_download_url", ""),
-            "plugin_type": plugin_type,
-            "description": description,
-            "sha256": sha,
-            "size_bytes": size,
-            "tags": tags,
-        }
-        entries.append(entry)
-        print(f"  ok: {slug} {version} ({name}) — {asset_name} ({size} bytes)")
+            # --- read the zip's file listing (the AI brain needs this) ---
+            zip_contents = list_zip_contents(local_path)
+            os.remove(local_path)
+
+            # --- the AI brain: analyze everything, decide all metadata ---
+            slug, name, version, description, tags, plugin_type = (
+                None, None, None, None, [], "aeplugin"
+            )
+
+            # Explicit body fields always win — these OVERRIDE the AI's
+            # choices and apply to every zip on this release.
+            if body_plugin_type:
+                plugin_type = body_plugin_type
+            if body_description:
+                description = body_description
+            if body_tags:
+                tags = list(body_tags)
+
+            need_ai = (slug is None or name is None or version is None
+                       or description is None or not tags)
+            ai_result = None
+            if ai_enabled and need_ai:
+                ai_result = analyze_with_ai(tag, title, body, asset_name,
+                                            zip_contents, ai_token)
+                if ai_result:
+                    if slug is None and ai_result.get("id"):
+                        slug = sanitize_slug(ai_result["id"])
+                    if name is None and ai_result.get("name"):
+                        name = str(ai_result["name"]).strip()
+                    if version is None and ai_result.get("version"):
+                        version = str(ai_result["version"]).strip()
+                    if description is None and ai_result.get("description"):
+                        description = str(ai_result["description"]).strip()
+                    if not tags and ai_result.get("tags"):
+                        suggested = ai_result["tags"]
+                        if isinstance(suggested, list):
+                            tags = [str(t).strip().lower() for t in suggested
+                                    if str(t).strip()][:5]
+                    # plugin_type: only override if the body didn't set it.
+                    if not body_plugin_type and ai_result.get("plugin_type"):
+                        pt = str(ai_result["plugin_type"]).strip().lower()
+                        if pt in ("aeplugin", "core"):
+                            plugin_type = pt
+                    print(f"  ai: analyzed '{asset_name}' -> id={slug} v{version}")
+                else:
+                    print(f"  ai: brain failed for '{asset_name}' — using fallback",
+                          file=sys.stderr)
+
+            # --- heuristic fallbacks (safety net — always run) ---
+            if not slug:
+                # Derive from the asset filename (more specific than the
+                # tag when a release has multiple zips).
+                stem = Path(asset_name).stem
+                slug = sanitize_slug(stem) or sanitize_slug(tag) or "plugin"
+            if not name:
+                name = title or slug_to_name(slug)
+            if not version:
+                version = "1.0"
+
+            pub = rel.get("published_at") or ""
+            last_updated = pub[:10] if pub else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            # --- dedup by slug (newer release wins) ---
+            if slug in seen_ids:
+                print(f"  note: replacing older release for slug '{slug}'",
+                      file=sys.stderr)
+                entries = [e for e in entries if e["id"] != slug]
+            seen_ids.add(slug)
+
+            entry = {
+                "id": slug,
+                "category": "plugin",
+                "name": name,
+                "version": version,
+                "last_updated": last_updated,
+                "link": asset.get("browser_download_url", ""),
+                "plugin_type": plugin_type,
+                "description": description,
+                "sha256": sha,
+                "size_bytes": size,
+                "tags": tags,
+            }
+            entries.append(entry)
+            print(f"  ok: {slug} {version} — {asset_name} ({size} bytes)")
 
     entries.sort(key=lambda e: e["name"].lower())
 
