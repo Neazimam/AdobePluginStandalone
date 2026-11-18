@@ -2,8 +2,8 @@
   {
     "id": "saber-1-0-40",
     "category": "plugin",
-    "name": "Saber",
-    "version": "1.0.4",
+    "name": "Adobe-Pluginsexe",
+    "version": "1.0",
     "last_updated": "2026-11-13",
     "link": "https://github.com/Neazimam/AdobePluginStandalone/releases/download/standalone/Saber_1.0.40.zip",
     "plugin_type": "aeplugin",
@@ -15,8 +15,8 @@
   {
     "id": "topaz-video-ai-pro-7-1-6",
     "category": "plugin",
-    "name": "Topaz Video AI",
-    "version": "7.1.6",
+    "name": "Adobe-Pluginsexe",
+    "version": "1.0",
     "last_updated": "2026-11-13",
     "link": "https://github.com/Neazimam/AdobePluginStandalone/releases/download/standalone/Topaz.Video.AI.Pro-7.1.6.zip",
     "plugin_type": "aeplugin",
