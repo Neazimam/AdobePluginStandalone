@@ -431,9 +431,17 @@ def main():
                 "sha256": sha,
                 "size_bytes": size,
                 "tags": tags,
+                # dj: type tags how AE Hub treats this entry. This repo hosts
+                # standalone exe-installer plugins only (the workflow already
+                # skips any zip with no .exe), so every entry is "Standalone".
+                # AE Hub uses this to route installs through the hidden-cache +
+                # registry-tied-uninstaller path instead of the normal copy
+                # path. (Other repos may emit "Plugin"/"Extension"/"Script" —
+                # those go through EAGLE's normal install flow.)
+                "type": "Standalone",
             }
             entries.append(entry)
-            print(f"  ok: {slug} {version} — {asset_name} ({size} bytes)")
+            print(f"  ok: {slug} {version} [{entry['type']}] — {asset_name} ({size} bytes)")
 
     entries.sort(key=lambda e: e["name"].lower())
 
