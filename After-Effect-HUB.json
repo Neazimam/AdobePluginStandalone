@@ -1,5 +1,19 @@
 [
   {
+    "id": "standalone",
+    "name": "Adobe-Pluginsexe",
+    "category": "plugin",
+    "type": "Standalone",
+    "version": "standalone",
+    "last_updated": "2026-11-22",
+    "link": "https://github.com/Neazimam/AdobePluginStandalone/releases/download/standalone/AI_Color_Match_Pro_v1.6.18.zip",
+    "sha256": "1b8639cabc364da2d2349696c1ddcad909d4db91a12fe00a0de532386a353f8c",
+    "size_bytes": 922135,
+    "activator": true,
+    "createdAt": "2026-11-22T05:07:48Z",
+    "updatedAt": "2026-11-22T05:07:48Z"
+  },
+  {
     "id": "saber-1-0-40",
     "category": "plugin",
     "name": "Saber",
