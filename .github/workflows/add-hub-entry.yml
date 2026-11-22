@@ -92,6 +92,8 @@ jobs:
           fi
 
           # Re-fetch the release JSON (covers both branches).
+          # NOTE: gh's asset objects use the field `url` for the browser
+          # download URL — NOT `browser_download_url`. We use `.url` below.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,assets,url >/tmp/rel.json
 
           # EXACT release name — no trimming, no slugify, no case change.
@@ -102,34 +104,50 @@ jobs:
 
           echo ">> Using EXACT release name: '$EXACT_NAME'"
           echo ">> Tag: $REL_TAG"
+          echo ">> Asset count: $(jq '.assets | length' /tmp/rel.json)"
 
-          # Stash the asset download URLs for the next step.
-          jq -r '.assets[].browser_download_url' /tmp/rel.json > /tmp/assets.txt
-          echo ">> Asset URLs:"
-          cat /tmp/assets.txt
+          # Stash the primary .zip's browser_download_url (the gh `url` field)
+          # for the link/sha step. We pick the FIRST .zip asset, if any.
+          PRIMARY_ZIP_URL="$(jq -r '[.assets[] | select(.name | endswith(".zip"))][0].url // empty' /tmp/rel.json)"
+          echo ">> Primary zip URL: ${PRIMARY_ZIP_URL:-<none>}"
 
           # Expose to later steps.
-          echo "RELEASE_NAME=$EXACT_NAME"  >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=$REL_TAG"     >> "$GITHUB_ENV"
-          echo "RELEASE_URL=$REL_URL"     >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=$EXACT_NAME"   >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$REL_TAG"      >> "$GITHUB_ENV"
+          echo "RELEASE_URL=$REL_URL"      >> "$GITHUB_ENV"
+          echo "PRIMARY_ZIP_URL=$PRIMARY_ZIP_URL" >> "$GITHUB_ENV"
 
       # ---------- 3. Download + scan assets for .exe (inside zips too) ----------
+      # Bulk-download ALL assets in one shot with `gh release download <tag>`.
+      # No per-asset URL extraction needed — fewer moving parts, no field-name
+      # dependency. Then iterate over the files on disk by extension.
       - name: Detect .exe in release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p scan
+
+          # Bulk-download every asset attached to this release into ./scan.
+          # `--clobber` overwrites any stale file from a previous step/run.
+          echo ">> Bulk-downloading all assets for tag '$RELEASE_TAG'..."
+          if ! gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir scan --clobber; then
+            echo "::error::Failed to download assets for tag '$RELEASE_TAG'."
+            exit 1
+          fi
+
+          echo ">> Downloaded files:"
+          ls -la scan
+
           HAS_EXE=false
           HAS_ACTIVATOR=false
           PRIMARY_ZIP=""
 
-          while IFS= read -r URL; do
-            [ -z "$URL" ] && continue
-            FNAME="$(basename "$URL")"
-            DEST="scan/$FNAME"
-            echo ">> Downloading $FNAME ..."
-            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$FNAME" --dir scan --clobber
+          # Iterate over actual files on disk (sorted for stable output).
+          while IFS= read -r DEST; do
+            [ -z "$DEST" ] && continue
+            FNAME="$(basename "$DEST")"
+            echo ">> Inspecting $FNAME ..."
 
             case "$FNAME" in
               *.zip)
@@ -145,7 +163,7 @@ jobs:
                 if [ -n "$EXE_LIST" ]; then
                   HAS_EXE=true
                   echo "  Found exe inside zip:"
-                  echo "$EXE_LIST" | sed 's#^#    - #'
+                  echo "$EXE_LIST" | sed "s#^$EXTRACT_DIR#    - #"
                   if echo "$EXE_LIST" | grep -iq '/activator\.exe$'; then
                     HAS_ACTIVATOR=true
                     echo "  -> activator.exe detected"
@@ -160,7 +178,7 @@ jobs:
                 if [ "$FNAME" = "activator.exe" ]; then HAS_ACTIVATOR=true; fi
                 ;;
             esac
-          done < /tmp/assets.txt
+          done < <(find scan -maxdepth 1 -type f | sort)
 
           if [ "$HAS_EXE" = true ]; then
             ENTRY_TYPE="Standalone"
@@ -174,18 +192,19 @@ jobs:
           echo "PRIMARY_ZIP=$PRIMARY_ZIP"     >> "$GITHUB_ENV"
 
       # ---------- 4. sha256 + size_bytes of the primary .zip ----------
+      # The `link` field is the primary zip's browser_download_url that we
+      # stashed in step 2 (gh's `url` field on the asset object).
       - name: Hash + size the primary zip
         run: |
           set -euo pipefail
           SHA=""
           SIZE=0
-          LINK=""
+          LINK="$PRIMARY_ZIP_URL"
           if [ -n "$PRIMARY_ZIP" ] && [ -f "$PRIMARY_ZIP" ]; then
             SHA="$(sha256sum "$PRIMARY_ZIP" | awk '{print $1}')"
             SIZE="$(stat -c %s "$PRIMARY_ZIP")"
-            LINK="$(grep -E '\.zip$' /tmp/assets.txt | head -n1)"
           else
-            echo "::warning::No .zip asset on this release — sha256/size/link will be empty."
+            echo "::warning::No .zip asset on this release — sha256/size will be empty."
           fi
           echo ">> sha256 = $SHA"
           echo ">> size   = $SIZE"
