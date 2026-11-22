@@ -9,7 +9,12 @@
 # HOW TO USE:
 #   1. Upload one or more .zip assets to a release in your repo.
 #   2. Actions tab → "Add HUB Entry" → Run workflow.
-#   3. Leave release_tag EMPTY (uses the latest release) OR type the tag.
+#   3. In the `release_tag` box, type ANY of:
+#        - nothing (empty) -> uses the latest published release.
+#        - the exact tag            (e.g. `standalone`)
+#        - the exact release name   (e.g. `Adobe-Pluginsexe`)
+#        - a substring that matches only ONE release (case-insensitive,
+#          matched against both tag and name — e.g. `adobe` if it's unique)
 #   4. Workflow downloads every .zip asset, scans each for .exe, and adds
 #      ONE entry PER .zip into After-Effect-HUB.json, then commits.
 #
@@ -51,7 +56,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Tag of the release to scan (leave EMPTY for the latest release)"
+        description: "Tag OR name (or partial) of the release to scan — leave EMPTY for latest"
         required: false
         type: string
         default: ""
@@ -71,9 +76,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------- 2. Resolve the release ----------
-      # Empty tag  -> use the latest published release.
-      # Bad tag    -> list every real tag in the repo + exit 1 (no silent blowup).
+      # ---------- 2. Resolve the release (DYNAMIC) ----------
+      # The `release_tag` input can be any of:
+      #   (a) EMPTY                  -> use the latest published release.
+      #   (b) an exact tag            -> use it directly.
+      #   (c) an exact release name   -> use that release's tag.
+      #   (d) a unique substring of a tag OR name (case-insensitive)
+      #                                -> use the single match's tag.
+      # If nothing matches, OR if the substring matches more than one release,
+      # list every release in the repo and stop.
       - name: Resolve release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,35 +92,73 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Fetch every published release (up to 100) once, as JSON.
+          # `gh release list` returns newest first.
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,name > /tmp/all-releases.json
+
+          REL_COUNT="$(jq 'length' /tmp/all-releases.json)"
+          if [ "$REL_COUNT" -eq 0 ]; then
+            echo "::error::This repo has NO published releases. Upload a release first, then re-run."
+            exit 1
+          fi
+
           if [ -z "${INPUT_TAG// /}" ]; then
+            # (a) EMPTY -> latest.
+            TAG="$(jq -r '.[0].tagName' /tmp/all-releases.json)"
             echo ">> No release_tag given — using the latest published release."
-            TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName')"
-            if [ -z "$TAG" ]; then
-              echo "::error::This repo has NO published releases. Upload a release first, then re-run."
-              exit 1
-            fi
             echo ">> Latest release tag: $TAG"
           else
-            TAG="$(echo -n "$INPUT_TAG" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            echo ">> Fetching release for tag: '$TAG'"
-            if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,assets,url >/tmp/rel.json 2>/dev/null; then
-              echo "::error::Release with tag '$TAG' was NOT FOUND. Tags that DO exist in this repo:"
-              echo "----- available release tags -----"
-              gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName,name --jq '.[] | "  - " + .tagName + "  (" + .name + ")"'
-              echo "---------------------------------"
-              echo "Re-run with one of the tags above, or leave the input empty to use the latest."
+            QUERY="$(echo -n "$INPUT_TAG" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            echo ">> Resolving input '$QUERY' ..."
+
+            # (b) exact tag match (case-sensitive).
+            EXACT_TAG_HIT="$(jq -r --arg q "$QUERY" \
+              'first(.[].tagName | select(. == $q)) // empty' /tmp/all-releases.json)"
+
+            # (c) exact release-name match (case-sensitive).
+            EXACT_NAME_HIT="$(jq -r --arg q "$QUERY" \
+              'first(.[] | select(.name == $q) | .tagName) // empty' /tmp/all-releases.json)"
+
+            # (d) unique substring (case-insensitive) of tagName OR name.
+            # We collect every match, then take the tag only if exactly one.
+            SUBSTR_HITS="$(jq -r --arg q "$QUERY" \
+              '[.[] | select((.tagName | ascii_downcase | contains($q | ascii_downcase)) or (.name | ascii_downcase | contains($q | ascii_downcase))) | .tagName] | unique' \
+              /tmp/all-releases.json)"
+
+            if [ -n "$EXACT_TAG_HIT" ]; then
+              TAG="$EXACT_TAG_HIT"
+              echo ">> Matched by exact tag: $TAG"
+            elif [ -n "$EXACT_NAME_HIT" ]; then
+              TAG="$EXACT_NAME_HIT"
+              echo ">> Matched by exact release name: $TAG"
+            elif [ "$(echo "$SUBSTR_HITS" | jq 'length')" -eq 1 ]; then
+              TAG="$(echo "$SUBSTR_HITS" | jq -r '.[0]')"
+              echo ">> Matched by unique substring: $TAG"
+            else
+              echo "::error::Could not resolve '$QUERY' to a single release."
+              echo "Substring matches found: $(echo "$SUBSTR_HITS" | jq -r 'length')"
+              echo "$SUBSTR_HITS" | jq -r '.[] | "  - " + .' 2>/dev/null || true
+              echo ""
+              echo "----- all releases in this repo -----"
+              jq -r '.[] | "  - " + .tagName + "  (" + .name + ")"' /tmp/all-releases.json
+              echo "-------------------------------------"
+              echo "Re-run with an exact tag, an exact name, or a substring that matches only ONE release."
+              echo "Or leave the input empty to use the latest release."
               exit 1
             fi
           fi
 
-          # Re-fetch the release JSON (covers both branches).
+          # Re-fetch the resolved release's full JSON.
           # NOTE: gh's asset objects use the field `url` for the browser
           # download URL — NOT `browser_download_url`.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,assets,url >/tmp/rel.json
 
           REL_TAG="$(jq -r '.tagName' /tmp/rel.json)"
-          echo ">> Tag: $REL_TAG"
-          echo ">> Asset count: $(jq '.assets | length' /tmp/rel.json)"
+          REL_NAME="$(jq -r '.name // empty' /tmp/rel.json)"
+          echo ">> Resolved tag:    $REL_TAG"
+          echo ">> Release name:    ${REL_NAME:-<untitled>}"
+          echo ">> Asset count:     $(jq '.assets | length' /tmp/rel.json)"
           echo ">> .zip assets:"
           jq -r '.assets[] | select(.name | endswith(".zip")) | "  - " + .name + "  ->  " + .url' /tmp/rel.json
 
