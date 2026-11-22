@@ -11,7 +11,7 @@
     "size_bytes": 922135,
     "activator": true,
     "createdAt": "2026-11-22T05:07:48Z",
-    "updatedAt": "2026-11-22T05:33:19Z"
+    "updatedAt": "2026-11-22T10:01:06Z"
   },
   {
     "id": "ai-depth-of-field-v1-3-9",
@@ -25,7 +25,7 @@
     "size_bytes": 922135,
     "activator": true,
     "createdAt": "2026-11-22T05:33:19Z",
-    "updatedAt": "2026-11-22T05:33:19Z"
+    "updatedAt": "2026-11-22T10:01:06Z"
   },
   {
     "id": "ai-relight-pro-v1-2-14",
@@ -39,7 +39,7 @@
     "size_bytes": 922135,
     "activator": true,
     "createdAt": "2026-11-22T05:33:19Z",
-    "updatedAt": "2026-11-22T05:33:19Z"
+    "updatedAt": "2026-11-22T10:01:06Z"
   },
   {
     "id": "face-director-v1-11-10",
@@ -53,7 +53,21 @@
     "size_bytes": 922135,
     "activator": true,
     "createdAt": "2026-11-22T05:33:19Z",
-    "updatedAt": "2026-11-22T05:33:19Z"
+    "updatedAt": "2026-11-22T10:01:06Z"
+  },
+  {
+    "id": "fx-console-1-0-6",
+    "name": "Fx Console",
+    "category": "plugin",
+    "type": "Standalone",
+    "version": "1.0.6",
+    "last_updated": "2026-11-22",
+    "link": "https://github.com/Neazimam/AdobePluginStandalone/releases/download/standalone/Fx-Console-1.0.6.zip",
+    "sha256": "d5cf6af7fb3bb21e63706e94dca6355c5c01c1fd0ed1963e3d415915e4cf97f6",
+    "size_bytes": 1735567,
+    "activator": false,
+    "createdAt": "2026-11-22T10:01:06Z",
+    "updatedAt": "2026-11-22T10:01:06Z"
   },
   {
     "id": "more-motion-blur-v1-1-11",
@@ -67,7 +81,7 @@
     "size_bytes": 922135,
     "activator": true,
     "createdAt": "2026-11-22T05:33:19Z",
-    "updatedAt": "2026-11-22T05:33:19Z"
+    "updatedAt": "2026-11-22T10:01:06Z"
   },
   {
     "id": "productioncrate-1-6-14",
@@ -81,7 +95,7 @@
     "size_bytes": 159578517,
     "activator": false,
     "createdAt": "2026-11-22T05:33:20Z",
-    "updatedAt": "2026-11-22T05:33:20Z"
+    "updatedAt": "2026-11-22T10:01:07Z"
   },
   {
     "id": "saber-1-0-40",
@@ -97,7 +111,7 @@
     "tags": [],
     "type": "Standalone",
     "activator": false,
-    "updatedAt": "2026-11-22T05:33:20Z",
+    "updatedAt": "2026-11-22T10:01:07Z",
     "createdAt": "2026-11-22T05:33:20Z"
   },
   {
@@ -112,7 +126,7 @@
     "size_bytes": 922135,
     "activator": true,
     "createdAt": "2026-11-22T05:33:20Z",
-    "updatedAt": "2026-11-22T05:33:20Z"
+    "updatedAt": "2026-11-22T10:01:07Z"
   },
   {
     "id": "topaz-video-ai-pro-7-1-6",
@@ -128,7 +142,7 @@
     "tags": [],
     "type": "Standalone",
     "activator": true,
-    "updatedAt": "2026-11-22T05:33:22Z",
+    "updatedAt": "2026-11-22T10:01:09Z",
     "createdAt": "2026-11-22T05:33:22Z"
   }
 ]
