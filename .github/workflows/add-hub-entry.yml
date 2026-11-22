@@ -1,41 +1,57 @@
-# Add (or update) ONE entry in After-Effect-HUB.json for a single release.
+# Add (or update) entries in After-Effect-HUB.json — ONE ENTRY PER .ZIP ASSET.
 #
 # ONE FILE. No Python. No external script. Everything runs inline in bash + jq.
 #
 # MANUAL ONLY — never runs automatically. No `on: release`, no `on: push`,
 # no `schedule`. You trigger it yourself from the Actions tab after uploading
-# a release.
+# assets to a release.
 #
 # HOW TO USE:
-#   1. Upload a release (title = whatever you want; that exact string becomes
-#      the JSON entry's "name" field — never modified).
+#   1. Upload one or more .zip assets to a release in your repo.
 #   2. Actions tab → "Add HUB Entry" → Run workflow.
 #   3. Leave release_tag EMPTY (uses the latest release) OR type the tag.
-#   4. Workflow resolves the release, scans assets for .exe, adds/updates the
-#      entry in After-Effect-HUB.json, commits back.
+#   4. Workflow downloads every .zip asset, scans each for .exe, and adds
+#      ONE entry PER .zip into After-Effect-HUB.json, then commits.
 #
-# WHAT IT DOES PER STEP:
-#   - Resolve release: empty tag → latest; bad tag → list real tags + STOP.
-#   - Detect exe: download each .zip, unzip, recursively grep for *.exe.
-#       exe found  -> type = "Standalone"
-#       no exe     -> type = "Plugin"
-#     Also specifically looks for activator.exe.
-#   - Hash + size: sha256 + size_bytes of the primary .zip asset.
-#   - Add entry: dedup by id OR exact name → update if exists, append if new.
-#     The "name" field is the EXACT release title (byte-for-byte).
-#   - Commit: only if the JSON actually changed.
+# WHY ONE ENTRY PER .ZIP (not per release):
+#   A single release often ships several plugins (e.g. Saber.zip, Topaz.zip,
+#   AI_Color_Match_Pro.zip all under the "standalone" tag). Each .zip is its
+#   own installable plugin, so it gets its own entry. The entry's `name` is
+#   derived from the .zip filename (e.g. "Saber_1.0.40.zip" → "Saber"), NOT
+#   the release title — so all assets under one release get distinct names.
+#
+# NAME BEAUTIFICATION (from the .zip filename):
+#   AI_Color_Match_Pro_v1.6.18.zip  -> name="AI Color Match Pro"  version="1.6.18"
+#   Saber_1.0.40.zip                -> name="Saber"               version="1.0.40"
+#   Topaz.Video.AI.Pro-7.1.6.zip    -> name="Topaz Video AI Pro"  version="7.1.6"
+#   - Trailing version (with/without v) is stripped from the name.
+#   - Underscores/dots/dashes become spaces, collapsed and trimmed.
+#   - The version is the trailing numeric run.
+#
+# DEDUP / UPDATE POLICY (so re-runs don't duplicate and don't clobber edits):
+#   An existing entry is matched by ID (case-insensitive) OR by `link`
+#   (the asset's browser_download_url — stable across name edits).
+#   - Match found  -> UPDATE technical fields only: type, activator, sha256,
+#                    size_bytes, link, version (if filename version present),
+#                    last_updated, updatedAt. PRESERVES any hand-edited
+#                    name / plugin_type / description / tags / category.
+#   - No match     -> APPEND a new entry with beautified name + computed fields.
+#   - The `name` you type into the release title is NOT used — only the
+#     .zip filenames. So you can freely rename entries in the JSON later
+#     without the workflow clobbering your edits.
+#
+# DETECTION:
+#   Each .zip is unzipped and recursively scanned for any .exe.
+#     .exe found        -> type = "Standalone", plus activator=true if
+#                          activator.exe is anywhere inside the zip.
+#     no .exe found     -> type = "Plugin".
 name: Add HUB Entry
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Tag of the release to add (leave EMPTY for the latest release)"
-        required: false
-        type: string
-        default: ""
-      entry_id:
-        description: "Force a specific id slug (optional — defaults to a slug of the tag)"
+        description: "Tag of the release to scan (leave EMPTY for the latest release)"
         required: false
         type: string
         default: ""
@@ -74,13 +90,8 @@ jobs:
             fi
             echo ">> Latest release tag: $TAG"
           else
-            # ltrim + rtrim the tag the user typed.
             TAG="$(echo -n "$INPUT_TAG" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             echo ">> Fetching release for tag: '$TAG'"
-
-            # Verify the tag exists BEFORE doing anything else. `gh release
-            # view` returns non-zero if not found — we catch that and list
-            # every real tag so the user can see what to type next time.
             if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,assets,url >/tmp/rel.json 2>/dev/null; then
               echo "::error::Release with tag '$TAG' was NOT FOUND. Tags that DO exist in this repo:"
               echo "----- available release tags -----"
@@ -93,133 +104,143 @@ jobs:
 
           # Re-fetch the release JSON (covers both branches).
           # NOTE: gh's asset objects use the field `url` for the browser
-          # download URL — NOT `browser_download_url`. We use `.url` below.
+          # download URL — NOT `browser_download_url`.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,assets,url >/tmp/rel.json
 
-          # EXACT release name — no trimming, no slugify, no case change.
-          # Fall back to the tag only if the release genuinely has no title.
-          EXACT_NAME="$(jq -r 'if (.name | length) > 0 then .name else .tagName end' /tmp/rel.json)"
           REL_TAG="$(jq -r '.tagName' /tmp/rel.json)"
-          REL_URL="$(jq -r '.url' /tmp/rel.json)"
-
-          echo ">> Using EXACT release name: '$EXACT_NAME'"
           echo ">> Tag: $REL_TAG"
           echo ">> Asset count: $(jq '.assets | length' /tmp/rel.json)"
+          echo ">> .zip assets:"
+          jq -r '.assets[] | select(.name | endswith(".zip")) | "  - " + .name + "  ->  " + .url' /tmp/rel.json
 
-          # Stash the primary .zip's browser_download_url (the gh `url` field)
-          # for the link/sha step. We pick the FIRST .zip asset, if any.
-          PRIMARY_ZIP_URL="$(jq -r '[.assets[] | select(.name | endswith(".zip"))][0].url // empty' /tmp/rel.json)"
-          echo ">> Primary zip URL: ${PRIMARY_ZIP_URL:-<none>}"
+          ZIP_COUNT="$(jq '[.assets[] | select(.name | endswith(".zip"))] | length' /tmp/rel.json)"
+          if [ "$ZIP_COUNT" -eq 0 ]; then
+            echo "::error::This release has NO .zip assets. Nothing to add."
+            exit 1
+          fi
 
-          # Expose to later steps.
-          echo "RELEASE_NAME=$EXACT_NAME"   >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=$REL_TAG"      >> "$GITHUB_ENV"
-          echo "RELEASE_URL=$REL_URL"      >> "$GITHUB_ENV"
-          echo "PRIMARY_ZIP_URL=$PRIMARY_ZIP_URL" >> "$GITHUB_ENV"
+          # Stash the list of (name,url) pairs for .zip assets as TSV so the
+          # next step can iterate cleanly.
+          jq -r '.assets[] | select(.name | endswith(".zip")) | [.name, .url] | @tsv' /tmp/rel.json > /tmp/zips.tsv
 
-      # ---------- 3. Download + scan assets for .exe (inside zips too) ----------
-      # Bulk-download ALL assets in one shot with `gh release download <tag>`.
-      # No per-asset URL extraction needed — fewer moving parts, no field-name
-      # dependency. Then iterate over the files on disk by extension.
-      - name: Detect .exe in release assets
+          echo "RELEASE_TAG=$REL_TAG" >> "$GITHUB_ENV"
+
+      # ---------- 3. Download all assets + scan each .zip for .exe ----------
+      # Bulk-download everything, then iterate over the .zip files only.
+      # For each .zip we compute: id, beautified name, version, type,
+      # activator flag, sha256, size, link. Results land in /tmp/entries.jsonl
+      # (one JSON object per line) for the merge step to consume.
+      - name: Scan assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p scan
 
-          # Bulk-download every asset attached to this release into ./scan.
-          # `--clobber` overwrites any stale file from a previous step/run.
           echo ">> Bulk-downloading all assets for tag '$RELEASE_TAG'..."
           if ! gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir scan --clobber; then
             echo "::error::Failed to download assets for tag '$RELEASE_TAG'."
             exit 1
           fi
-
           echo ">> Downloaded files:"
           ls -la scan
 
-          HAS_EXE=false
-          HAS_ACTIVATOR=false
-          PRIMARY_ZIP=""
+          # Output file: one JSON entry per line (JSONL).
+          : > /tmp/entries.jsonl
 
-          # Iterate over actual files on disk (sorted for stable output).
-          while IFS= read -r DEST; do
-            [ -z "$DEST" ] && continue
-            FNAME="$(basename "$DEST")"
-            echo ">> Inspecting $FNAME ..."
+          # Iterate over .zip assets (sorted for stable output).
+          while IFS=$'\t' read -r FNAME URL; do
+            [ -z "$FNAME" ] && continue
+            DEST="scan/$FNAME"
+            echo ""
+            echo "================ $FNAME ================"
 
-            case "$FNAME" in
-              *.zip)
-                if [ -z "$PRIMARY_ZIP" ]; then PRIMARY_ZIP="$DEST"; fi
-                EXTRACT_DIR="scan/${FNAME%.zip}"
-                mkdir -p "$EXTRACT_DIR"
-                if ! unzip -q "$DEST" -d "$EXTRACT_DIR" 2>/dev/null; then
-                  echo "  (zip could not be extracted)"
-                  continue
-                fi
-                # Recursive case-insensitive search for ANY .exe.
-                EXE_LIST="$(find "$EXTRACT_DIR" -type f -iname '*.exe' 2>/dev/null || true)"
-                if [ -n "$EXE_LIST" ]; then
-                  HAS_EXE=true
-                  echo "  Found exe inside zip:"
-                  echo "$EXE_LIST" | sed "s#^$EXTRACT_DIR#    - #"
-                  if echo "$EXE_LIST" | grep -iq '/activator\.exe$'; then
-                    HAS_ACTIVATOR=true
-                    echo "  -> activator.exe detected"
-                  fi
-                else
-                  echo "  (no .exe inside zip)"
-                fi
-                ;;
-              *.exe)
+            # ---- Beautify name + extract version from the filename ----
+            BASE="${FNAME%.zip}"
+            # Strip trailing version: optional sep + optional v + digits(.digits)*
+            BASE_NO_VER="$(echo "$BASE" | sed -E 's/[-_. ]?[vV]?[0-9]+(\.[0-9]+)*$//')"
+            [ -z "$BASE_NO_VER" ] && BASE_NO_VER="$BASE"
+            BEAUTY="$(echo "$BASE_NO_VER" | tr '_.-' '   ' | sed -E 's/  +/ /g' | sed -E 's/^ +//;s/ +$//')"
+            [ -z "$BEAUTY" ] && BEAUTY="$BASE"
+            # Version = trailing numeric run (digits with dots). Default "1.0".
+            VERSION="$(echo "$BASE" | grep -oE '[0-9]+(\.[0-9]+)*' | tail -1 || true)"
+            [ -z "$VERSION" ] && VERSION="1.0"
+            # ID = slug of the FULL filename (with version) so versions stay unique.
+            ID="$(echo -n "$BASE" | tr -c 'a-zA-Z0-9' '-' | sed 's/^-*//;s/-*$//' | tr 'A-Z' 'a-z')"
+            [ -z "$ID" ] && ID="entry-$(date -u +%Y%m%d%H%M%S)"
+
+            echo "  name    = $BEAUTY"
+            echo "  version = $VERSION"
+            echo "  id      = $ID"
+
+            # ---- Unzip + scan for .exe ----
+            HAS_EXE=false
+            HAS_ACTIVATOR=false
+            EXTRACT_DIR="scan/${BASE}"
+            mkdir -p "$EXTRACT_DIR"
+            if unzip -q "$DEST" -d "$EXTRACT_DIR" 2>/dev/null; then
+              EXE_LIST="$(find "$EXTRACT_DIR" -type f -iname '*.exe' 2>/dev/null || true)"
+              if [ -n "$EXE_LIST" ]; then
                 HAS_EXE=true
-                echo "  Found exe asset: $FNAME"
-                if [ "$FNAME" = "activator.exe" ]; then HAS_ACTIVATOR=true; fi
-                ;;
-            esac
-          done < <(find scan -maxdepth 1 -type f | sort)
+                echo "  exe found inside zip:"
+                echo "$EXE_LIST" | sed "s#^$EXTRACT_DIR#    - #"
+                if echo "$EXE_LIST" | grep -iq '/activator\.exe$'; then
+                  HAS_ACTIVATOR=true
+                  echo "  -> activator.exe detected"
+                fi
+              else
+                echo "  no .exe inside zip"
+              fi
+            else
+              echo "  (zip could not be extracted — treating as Plugin)"
+            fi
 
-          if [ "$HAS_EXE" = true ]; then
-            ENTRY_TYPE="Standalone"
-          else
-            ENTRY_TYPE="Plugin"
-          fi
-          echo ">> Entry type => $ENTRY_TYPE  (activator=$HAS_ACTIVATOR)"
+            if [ "$HAS_EXE" = true ]; then ENTRY_TYPE="Standalone"; else ENTRY_TYPE="Plugin"; fi
+            echo "  type     = $ENTRY_TYPE"
+            echo "  activator= $HAS_ACTIVATOR"
 
-          echo "ENTRY_TYPE=$ENTRY_TYPE"       >> "$GITHUB_ENV"
-          echo "HAS_ACTIVATOR=$HAS_ACTIVATOR" >> "$GITHUB_ENV"
-          echo "PRIMARY_ZIP=$PRIMARY_ZIP"     >> "$GITHUB_ENV"
+            # ---- sha256 + size of the .zip itself ----
+            SHA="$(sha256sum "$DEST" | awk '{print $1}')"
+            SIZE="$(stat -c %s "$DEST")"
+            echo "  sha256   = $SHA"
+            echo "  size     = $SIZE"
+            echo "  link     = $URL"
 
-      # ---------- 4. sha256 + size_bytes of the primary .zip ----------
-      # The `link` field is the primary zip's browser_download_url that we
-      # stashed in step 2 (gh's `url` field on the asset object).
-      - name: Hash + size the primary zip
-        run: |
-          set -euo pipefail
-          SHA=""
-          SIZE=0
-          LINK="$PRIMARY_ZIP_URL"
-          if [ -n "$PRIMARY_ZIP" ] && [ -f "$PRIMARY_ZIP" ]; then
-            SHA="$(sha256sum "$PRIMARY_ZIP" | awk '{print $1}')"
-            SIZE="$(stat -c %s "$PRIMARY_ZIP")"
-          else
-            echo "::warning::No .zip asset on this release — sha256/size will be empty."
-          fi
-          echo ">> sha256 = $SHA"
-          echo ">> size   = $SIZE"
-          echo ">> link   = $LINK"
-          echo "ASSET_SHA256=$SHA" >> "$GITHUB_ENV"
-          echo "ASSET_SIZE=$SIZE"  >> "$GITHUB_ENV"
-          echo "ASSET_LINK=$LINK"  >> "$GITHUB_ENV"
+            # ---- Emit one JSON entry line ----
+            NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            DATE_SHORT="${NOW:0:10}"
+            jq -n -c \
+              --arg id "$ID" \
+              --arg name "$BEAUTY" \
+              --arg type "$ENTRY_TYPE" \
+              --arg version "$VERSION" \
+              --arg last_updated "$DATE_SHORT" \
+              --arg link "$URL" \
+              --arg sha256 "$SHA" \
+              --argjson size_bytes "$SIZE" \
+              --argjson activator "$([ "$HAS_ACTIVATOR" = true ] && echo true || echo false)" \
+              --arg now "$NOW" \
+              '{id:$id, name:$name, category:"plugin", type:$type, version:$version,
+                last_updated:$last_updated, link:$link, sha256:$sha256,
+                size_bytes:$size_bytes, activator:$activator,
+                createdAt:$now, updatedAt:$now}' >> /tmp/entries.jsonl
+          done < <(sort /tmp/zips.tsv)
 
-      # ---------- 5. Add / update the entry in After-Effect-HUB.json ----------
-      # Dedup by id OR exact name → update if exists, append if new.
-      # The "name" field is the EXACT release title — never modified.
-      # All JSON manipulation in jq so quoting/escaping is always correct.
+          echo ""
+          echo ">> Entries to merge:"
+          jq -s '.' /tmp/entries.jsonl
+
+      # ---------- 4. Merge entries into After-Effect-HUB.json ----------
+      # For each new entry:
+      #   - match existing by id (case-insensitive) OR by link (browser url).
+      #     Matching by LINK is what makes manual name edits survive: even if
+      #     you renamed "Saber" to "My Saber Plugin" in the JSON, the link is
+      #     unchanged so we still find and update the right entry.
+      #   - on match: refresh only technical fields (type, activator, sha256,
+      #     size_bytes, link, version, last_updated, updatedAt). PRESERVE
+      #     name, category, plugin_type, description, tags, createdAt.
+      #   - on no match: append the new entry.
       - name: Update After-Effect-HUB.json
-        env:
-          ENTRY_ID_OVERRIDE: ${{ github.event.inputs.entry_id }}
         run: |
           set -euo pipefail
           JSON_PATH="After-Effect-HUB.json"
@@ -227,86 +248,59 @@ jobs:
             echo ">> After-Effect-HUB.json not found, creating empty array."
             echo "[]" > "$JSON_PATH"
           fi
-
-          # Normalize: empty file -> []; single object -> array.
           if [ ! -s "$JSON_PATH" ]; then echo "[]" > "$JSON_PATH"; fi
+          # Normalize single object -> array.
           if ! jq -e 'type == "array"' "$JSON_PATH" >/dev/null 2>&1; then
             jq '[.]' "$JSON_PATH" > /tmp/wrapped.json && mv /tmp/wrapped.json "$JSON_PATH"
           fi
 
-          # ID: explicit override wins, else slugify the TAG (never the name).
-          if [ -n "${ENTRY_ID_OVERRIDE// /}" ]; then
-            ID="$ENTRY_ID_OVERRIDE"
-          else
-            ID="$(echo -n "$RELEASE_TAG" | tr -c 'a-zA-Z0-9' '-' | sed 's/^-*//;s/-*$//' | tr 'A-Z' 'a-z')"
-            if [ -z "$ID" ]; then
-              ID="entry-$(date -u +%Y%m%d%H%M%S)"
+          cp "$JSON_PATH" /tmp/hub.json
+          ADDED=0; UPDATED=0
+
+          while IFS= read -r LINE; do
+            [ -z "$LINE" ] && continue
+            ID="$(echo "$LINE" | jq -r '.id')"
+            LINK="$(echo "$LINE" | jq -r '.link')"
+
+            # Find existing index by id (case-insensitive) OR exact link.
+            EXISTING_IDX="$(jq --arg id "$ID" --arg link "$LINK" \
+              'to_entries | map(select((.value.id|ascii_downcase)==($id|ascii_downcase) or .value.link==$link)) | first | .key // empty' \
+              /tmp/hub.json)"
+
+            if [ -n "$EXISTING_IDX" ]; then
+              UPDATED=$((UPDATED+1))
+              echo ">> UPDATE entry at index $EXISTING_IDX (id=$ID)"
+              # Refresh technical fields only; PRESERVE name/category/plugin_type/description/tags/createdAt.
+              jq --argjson idx "$EXISTING_IDX" --argjson new "$LINE" \
+                '.[$idx] as $e
+                 | .[$idx] = ($e
+                     + {type: $new.type,
+                        activator: $new.activator,
+                        sha256: $new.sha256,
+                        size_bytes: $new.size_bytes,
+                        link: $new.link,
+                        version: $new.version,
+                        last_updated: $new.last_updated,
+                        updatedAt: $new.updatedAt})
+                 | if (.[$idx].createdAt // null) == null then .[$idx].createdAt = $new.updatedAt else . end' \
+                /tmp/hub.json > /tmp/hub.tmp
+              mv /tmp/hub.tmp /tmp/hub.json
+            else
+              ADDED=$((ADDED+1))
+              echo ">> ADD new entry (id=$ID, name=$(echo "$LINE" | jq -r '.name'))"
+              jq --argjson new "$LINE" '. + [$new]' /tmp/hub.json > /tmp/hub.tmp && mv /tmp/hub.tmp /tmp/hub.json
             fi
-          fi
-
-          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          DATE_SHORT="${NOW:0:10}"
-
-          echo ">> Building entry: id=$ID  name='$RELEASE_NAME'  type=$ENTRY_TYPE"
-
-          # Build the new entry object as JSON (jq handles all escaping).
-          NEW_ENTRY="$(jq -n \
-            --arg id "$ID" \
-            --arg name "$RELEASE_NAME" \
-            --arg type "$ENTRY_TYPE" \
-            --arg version "$RELEASE_TAG" \
-            --arg last_updated "$DATE_SHORT" \
-            --arg link "$ASSET_LINK" \
-            --arg sha256 "$ASSET_SHA256" \
-            --argjson size_bytes "$ASSET_SIZE" \
-            --argjson activator "$([ "$HAS_ACTIVATOR" = true ] && echo true || echo false)" \
-            --arg createdAt "$NOW" \
-            --arg updatedAt "$NOW" \
-            '{
-              id: $id,
-              name: $name,
-              category: "plugin",
-              type: $type,
-              version: $version,
-              last_updated: $last_updated,
-              link: $link,
-              sha256: $sha256,
-              size_bytes: $size_bytes,
-              activator: $activator,
-              createdAt: $createdAt,
-              updatedAt: $updatedAt
-            }')"
-
-          # Find existing entry by id (case-insensitive) OR exact name
-          # (case-sensitive). Returns the index, or empty if not found.
-          EXISTING_INDEX="$(jq --arg id "$ID" --arg name "$RELEASE_NAME" \
-            'to_entries | map(select((.value.id | ascii_downcase) == ($id | ascii_downcase) or .value.name == $name)) | first | .key // empty' \
-            "$JSON_PATH")"
-
-          if [ -n "$EXISTING_INDEX" ]; then
-            echo ">> Updating existing entry at index $EXISTING_INDEX (id=$ID)"
-            # Merge new fields onto the existing entry, preserve createdAt if
-            # it's already there, refresh updatedAt.
-            jq --argjson idx "$EXISTING_INDEX" --argjson new "$NEW_ENTRY" \
-              '(.[$idx] * $new) as $merged
-               | .[$idx] = $merged
-               | .[$idx].updatedAt = $new.updatedAt
-               | if (.[$idx].createdAt // null) == null
-                 then .[$idx].createdAt = $new.updatedAt
-                 else . end' \
-              "$JSON_PATH" > /tmp/hub.tmp && mv /tmp/hub.tmp "$JSON_PATH"
-          else
-            echo ">> Adding NEW entry with id=$ID"
-            jq --argjson new "$NEW_ENTRY" '. + [$new]' "$JSON_PATH" > /tmp/hub.tmp && mv /tmp/hub.tmp "$JSON_PATH"
-          fi
+          done < /tmp/entries.jsonl
 
           # Sort by name (case-insensitive) for a stable, reviewable diff.
-          jq 'sort_by(.name | ascii_downcase)' "$JSON_PATH" > /tmp/hub.tmp && mv /tmp/hub.tmp "$JSON_PATH"
+          jq 'sort_by(.name | ascii_downcase)' /tmp/hub.json > /tmp/hub.tmp && mv /tmp/hub.tmp /tmp/hub.json
 
+          cp /tmp/hub.json "$JSON_PATH"
+          echo ">> Added $ADDED new entry(ies); updated $UPDATED existing entry(ies)."
           echo "----- Resulting After-Effect-HUB.json -----"
           cat "$JSON_PATH"
 
-      # ---------- 6. Commit & push (only if JSON changed) ----------
+      # ---------- 5. Commit & push (only if JSON changed) ----------
       - name: Commit updated JSON
         run: |
           set -euo pipefail
@@ -316,7 +310,7 @@ jobs:
           if git diff --cached --quiet; then
             echo ">> No changes to After-Effect-HUB.json — nothing to commit."
           else
-            git commit -m "chore(hub): add/update entry '$RELEASE_NAME' (tag=$RELEASE_TAG, type=$ENTRY_TYPE)"
+            git commit -m "chore(hub): add/update entries from release '$RELEASE_TAG'"
             git push
             echo ">> Pushed commit."
           fi
